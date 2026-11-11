@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+*.writer.lock
+takeout-import-*.csv
+Takeout/
+takeout-preview.csv
+.env
