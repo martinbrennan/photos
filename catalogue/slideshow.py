@@ -70,6 +70,30 @@ class PhotoStore:
                         'count': count, 'url': f"/photo/{row['id']}"}
         return None
 
+    def adjacent(self, photo_id, direction):
+        """Find the nearest usable image in the catalogue's chronological order."""
+        operator, order = ('>', 'ASC') if direction == 'next' else ('<', 'DESC')
+        with closing(read_database(self.database)) as db:
+            db.execute('BEGIN')
+            current = db.execute('SELECT chronological_at FROM photos WHERE id=?', (photo_id,)).fetchone()
+            if current is None:
+                raise FileNotFoundError('Photo is not in the catalogue')
+            count = db.execute('SELECT COUNT(*) FROM photos').fetchone()[0]
+            rows = db.execute(
+                'SELECT p.*,a.root_path FROM photos p JOIN archives a ON a.id=p.archive_id '
+                f'WHERE (p.chronological_at,p.id) {operator} (?,?) '
+                f'ORDER BY p.chronological_at {order},p.id {order}',
+                (current['chronological_at'], photo_id))
+            for row in rows:
+                if Path(row['filename']).suffix.lower() not in SUPPORTED:
+                    continue
+                if self.failed.get(row['id'], 0) > time.monotonic():
+                    continue
+                return {'id': row['id'], 'filename': row['filename'], 'path': row['relative_path'],
+                        'date': row['captured_local'], 'camera': ' '.join(filter(None, [row['camera_make'], row['camera_model']])),
+                        'count': count, 'url': f"/photo/{row['id']}"}
+        return None
+
     def _render(self, path, root, size, mtime):
         # A native decoder can hold the GIL or hang on disk I/O. Keep it out of
         # the HTTP process, with a deadline that also kills/reaps the child.
@@ -133,9 +157,10 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
         def do_GET(self):
             try:
                 url = urlsplit(self.path)
-                if url.path in ('/', '/style.css', '/app.js'):
+                if url.path in ('/', '/style.css', '/app.js', '/zoom.js'):
                     name, kind = {'/': ('index.html', 'text/html; charset=utf-8'),
-                                  '/style.css': ('style.css', 'text/css'), '/app.js': ('app.js', 'text/javascript')}[url.path]
+                                  '/style.css': ('style.css', 'text/css'),
+                                  '/zoom.js': ('zoom.js', 'text/javascript'), '/app.js': ('app.js', 'text/javascript')}[url.path]
                     self.reply(200, (WEB / name).read_bytes(), kind)
                 elif url.path == '/api/config':
                     self.json(200, {'interval': interval, 'heif': HEIF})
@@ -146,6 +171,15 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
                         self.json(200, photo)
                     else:
                         self.json(503, {'error': 'No available photos found yet. Check the source disk; newly catalogued photos will appear automatically.'})
+                elif url.path == '/api/adjacent':
+                    query = parse_qs(url.query)
+                    value = query.get('current', [''])[0]
+                    direction = query.get('direction', [''])[0]
+                    if not value.isdigit() or direction not in ('next', 'previous'):
+                        self.json(400, {'error': 'A current photo and next or previous direction are required.'})
+                    else:
+                        photo = store.adjacent(int(value), direction)
+                        self.json(200, photo if photo else {'end': True})
                 elif url.path.startswith('/photo/') and url.path[7:].isdigit():
                     self.reply(200, store.image(int(url.path[7:])), 'image/jpeg')
                 else:

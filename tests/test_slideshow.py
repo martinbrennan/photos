@@ -69,6 +69,24 @@ class SlideshowTests(unittest.TestCase):
         self.assertEqual(self.store.image(photo['id']), rendered)
         self.assertEqual(self.store.render.cache_info().hits, 1)
 
+    def test_chronological_navigation(self):
+        for name in ['second.jpg', 'third.png', 'unsupported.txt']:
+            (self.root / name).write_bytes(self.photo.read_bytes())
+        scan(self.writer, self.root, Reader(), show_progress=False)
+        rows = self.writer.execute('SELECT id FROM photos ORDER BY id').fetchall()
+        ids = [row['id'] for row in rows]
+        # Equal dates must still have a stable order, independent of capture date.
+        self.writer.execute("UPDATE photos SET chronological_at='2020-01-01T00:00:00'")
+        self.writer.commit()
+        self.assertEqual(self.store.adjacent(ids[0], 'next')['id'], ids[1])
+        self.assertEqual(self.store.adjacent(ids[2], 'previous')['id'], ids[1])
+        self.assertIsNone(self.store.adjacent(ids[0], 'previous'))
+        self.assertIsNone(self.store.adjacent(ids[2], 'next'))
+        self.store.failed[ids[1]] = float('inf')
+        self.assertEqual(self.store.adjacent(ids[0], 'next')['id'], ids[2])
+        with self.assertRaises(FileNotFoundError):
+            self.store.adjacent(99999, 'next')
+
     def test_unavailable_and_outside_archive(self):
         photo_id = self.store.pick()['id']
         self.photo.unlink()
@@ -140,6 +158,12 @@ class SlideshowTests(unittest.TestCase):
                 self.assertEqual(json.load(response)['interval'], 7)
             with urlopen(base + '/api/random') as response:
                 photo = json.load(response)
+            with urlopen(base + f"/api/adjacent?current={photo['id']}&direction=next") as response:
+                self.assertEqual(json.load(response), {'end': True})
+            with self.assertRaises(HTTPError) as error:
+                urlopen(base + '/api/adjacent?current=1&direction=invalid')
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
             with urlopen(base + photo['url']) as response:
                 self.assertEqual(response.headers['Content-Type'], 'image/jpeg')
                 self.assertTrue(response.read().startswith(b'\xff\xd8'))

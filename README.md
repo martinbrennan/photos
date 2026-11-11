@@ -236,10 +236,22 @@ python3 photo_catalogue.py slideshow --interval 10
 ```
 
 Open <http://127.0.0.1:8765> on the NUC. Change the interval in the page, pause/play,
-advance manually, or use fullscreen. Space pauses, Right arrow advances, and F
-opens fullscreen when focus is outside a control. The interval is measured after
+advance manually, or use fullscreen. Back retraces successfully displayed images
+in this tab's session. Previous Image and Next Image navigate chronologically
+(using the catalogue's modification-time fallback for unknown capture dates),
+stopping at either end; matching dates are ordered by photo ID. Next Random and
+automatic playback choose random images. Space pauses, Left/Right navigate
+chronologically, B goes back, R chooses randomly, and F opens fullscreen when
+focus is outside a control. The interval is measured after
 the photo finishes loading; the browser remembers changes on this device. A
 remembered interval takes precedence over the initial `--interval` value.
+
+In either the normal or fullscreen image view, scroll up over the image to
+zoom in about the cursor, and scroll down to zoom out. Four wheel notches double
+the magnification. Zoom ranges from fit-to-window to two physical screen pixels
+per displayed preview pixel (four screen pixels in area); fit takes precedence
+if a small image already needs greater enlargement. Previews remain limited to
+2560 pixels per side. Changing image or resizing the view resets zoom to fit.
 
 The viewer reads the catalogue using SQLite `mode=ro` and `query_only`. It never
 runs schema setup or writes catalogue records. WAL allows the ongoing scan to
