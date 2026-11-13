@@ -7,6 +7,7 @@ import threading
 import subprocess
 import sys
 import time
+import tempfile
 from contextlib import closing
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +49,7 @@ class PhotoStore:
         self.full_lock = threading.Lock()
         self.failed = {}
         self.render_timeout = 25
+        self.source_cache = tempfile.TemporaryDirectory(prefix="popeye-preview-")
         # Per-server cache, bounded to eight screen-sized JPEGs, never original pixels.
         self.render = lru_cache(maxsize=8)(self._render)
 
@@ -127,7 +129,7 @@ class PhotoStore:
             result = subprocess.run(
                 [sys.executable, '-m', 'catalogue.render_worker'],
                 cwd=Path(__file__).resolve().parent.parent,
-                input=json.dumps({'path': path, 'root': root, 'recipe': json.loads(edits) if edits else None, 'edge': edge}).encode(),
+                input=json.dumps({'path': path, 'root': root, 'recipe': json.loads(edits) if edits else None, 'edge': edge, 'source_cache': self.source_cache.name}).encode(),
                 capture_output=True, timeout=self.render_timeout)
         except subprocess.TimeoutExpired as exc:
             log.error('Photo rendering timed out after %.1fs: %s', time.monotonic() - started, path)
@@ -236,7 +238,8 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
                 elif url.path.startswith('/api/render/') and url.path[12:].isdigit():
                     query = parse_qs(url.query)
                     try:
-                        edits = recipe({'version': 1, 'gamma': float(query.get('gamma', ['1'])[0])})
+                        edits = recipe({'version': 1, 'gamma': float(query.get('gamma', ['1'])[0]),
+                                        'pop': float(query.get('pop', ['0'])[0])})
                         edge = int(query.get('edge', ['1440'])[0])
                         if edge != 0 and not 64 <= edge <= 4096:
                             raise ValueError('Invalid output size')

@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let playing = true, busy = false, timer = null, previous = null, objectURL = null;
 let seconds = 10, active = null, generation = 0;
-let editing = false, savedRecipe = {version:1, gamma:1}, editSequence = 0;
+let editing = false, savedRecipe = {version:1, gamma:1, pop:0}, editSequence = 0;
 let previewTimer, highTimer, previewController, highController, sessionURL = null;
 const history = [];
 const photoZoom = createPhotoZoom($('stage'), $('photo'));
@@ -140,7 +140,7 @@ async function renderEdit(value, edge, sequence) {
   if (edge) previewController = controller; else highController = controller;
   let url;
   try {
-    const response = await fetch(`/api/render/${previous}?gamma=${value}&edge=${edge}`, {signal:controller.signal});
+    const response = await fetch(`/api/render/${previous}?gamma=${value.gamma}&pop=${value.pop}&edge=${edge}`, {signal:controller.signal});
     if (!response.ok) throw new Error('Render unavailable. Check pyvips installation or try again.');
     url = URL.createObjectURL(await response.blob());
     const image = new Image(); image.src = url;
@@ -155,10 +155,14 @@ async function renderEdit(value, edge, sequence) {
     if (sequence === editSequence && !controller.signal.aborted) $('edit-status').textContent = error.message;
   } finally { if (url) URL.revokeObjectURL(url); }
 }
+function currentRecipe() {
+  return {version:1, gamma:Number($('gamma').value), pop:Number($('pop').value)};
+}
 function adjust() {
   stopRenders();
-  const sequence = editSequence, value = Number($('gamma').value);
-  $('gamma-value').textContent = value.toFixed(2);
+  const sequence = editSequence, value = currentRecipe();
+  $('gamma-value').textContent = value.gamma.toFixed(2);
+  $('pop-value').textContent = value.pop;
   $('edit-status').textContent = 'Rendering preview…';
   // Coalesce rapid input; high resolution starts only after preview completes.
   const preview = new Promise(resolve => {
@@ -174,6 +178,7 @@ function closeEditor() {
   sessionURL = null;
   editing = false; $('editor').hidden = true; $('edit').disabled = false;
   $('save-edit').disabled = false; $('cancel-edit').disabled = false;
+  $('gamma').disabled = false; $('pop').disabled = false; $('reset-edit').disabled = false;
   schedule();
 }
 $('edit').onclick = async () => {
@@ -185,36 +190,42 @@ $('edit').onclick = async () => {
     savedRecipe = await response.json();
     sessionURL = objectURL;
     $('gamma').value = savedRecipe.gamma;
+    $('pop').value = savedRecipe.pop ?? 0;
+    $('pop-value').textContent = savedRecipe.pop ?? 0;
     $('gamma-value').textContent = Number(savedRecipe.gamma).toFixed(2);
     $('edit-status').textContent = '';
     $('editor').hidden = false;
   } catch (error) { closeEditor(); $('hint').textContent = error.message; }
 };
 $('gamma').oninput = adjust;
-$('reset-edit').onclick = () => { $('gamma').value = 1; adjust(); };
+$('pop').oninput = adjust;
+$('reset-edit').onclick = () => { $('gamma').value = 1; $('pop').value = 0; adjust(); };
 $('cancel-edit').onclick = async () => {
   stopRenders();
   $('save-edit').disabled = true; $('cancel-edit').disabled = true;
+  $('gamma').disabled = true; $('pop').disabled = true; $('reset-edit').disabled = true;
   if (objectURL && objectURL !== sessionURL) URL.revokeObjectURL(objectURL);
   objectURL = sessionURL; $('photo').src = sessionURL;
   closeEditor();
 };
 $('save-edit').onclick = async () => {
   $('save-edit').disabled = true; $('cancel-edit').disabled = true;
+  $('gamma').disabled = true; $('pop').disabled = true; $('reset-edit').disabled = true;
   try {
     const response = await fetch('/api/edits/' + previous, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({version:1,gamma:Number($('gamma').value)})});
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(currentRecipe())});
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Could not save edits');
     savedRecipe = data;
     // A quick Save must still display the committed value before leaving editing.
     stopRenders();
-    await renderEdit(data.gamma, 1440, editSequence);
-    renderEdit(data.gamma, 0, editSequence);
+    await renderEdit(data, 1440, editSequence);
+    renderEdit(data, 0, editSequence);
     closeEditor();
   } catch (error) {
     $('edit-status').textContent = error.message;
     $('save-edit').disabled = false; $('cancel-edit').disabled = false;
+    $('gamma').disabled = false; $('pop').disabled = false; $('reset-edit').disabled = false;
   }
 };
 

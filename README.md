@@ -407,7 +407,7 @@ Slideshow tests also cover HTTP endpoints, image rendering, source preservation,
 missing files, path boundaries, read-only enforcement and reads concurrent with a
 write transaction. HTTP tests need permission to bind a local loopback socket.
 
-## Non-destructive gamma editing
+## Non-destructive Gamma and Pop editing
 
 Install the processing engine on Debian/Ubuntu (including the NUC):
 
@@ -421,7 +421,7 @@ pip install 'pyvips[binary]>=3.0,<4'
 The viewer's Edit button opens one panel inside the image stage, available in
 normal and fullscreen modes. Editing suspends slideshow navigation and its timer;
 leaving fullscreen keeps the unsaved settings. Save commits; Cancel restores the
-exact image displayed before editing; Reset previews gamma 1 without saving.
+exact image displayed before editing; Reset previews Gamma 1 and Pop 0 without saving.
 A failed save leaves the panel open. Originals are never written.
 
 Gamma follows `output = input ** gamma` on normalized sRGB channels: values below
@@ -433,17 +433,17 @@ Neutral photographs retain the existing Pillow display path.
 
 On viewer startup, schema version 2 adds `photo_edits(photo_id, recipe, revision)`
 without changing photo records. Version 1 JSON recipes contain `version` and
-`gamma`; saves increment the revision and use the existing cooperative writer
+`gamma` and `pop` (0–100, default 0); old Gamma-only recipes remain valid.
+Saves increment the revision and use the existing cooperative writer
 lock. A running scan/import can temporarily prevent a save; retry afterwards.
 The viewer therefore requires a writable catalogue for migration and saving.
 Image reading connections remain read-only. No source disk write access is needed.
 
 `GET /api/edits/{id}` reads a recipe; JSON `POST` to the same URL saves it.
-`GET /api/render/{id}?gamma=0.8&edge=1440` requests a bounded render; `edge=0`
+`GET /api/render/{id}?gamma=0.8&pop=40&edge=1440` requests a bounded render; `edge=0`
 requests original dimensions (90MP safety ceiling). The central pipeline accepts
 an output edge and a versioned recipe; future effects belong there in a defined
-order, and region rendering can extend this contract. Gamma is the only enabled
-effect. `/photo/{id}` automatically applies saved recipes, including slideshow
+order, and region rendering can extend this contract. Gamma runs first, followed by Pop. `/photo/{id}` automatically applies saved recipes, including slideshow
 views and future consumers using that endpoint.
 
 Slider input coalesces for 60ms, requests a ~2MP square-bounded preview, then
@@ -454,10 +454,54 @@ Preview and full renders use separate worker slots, so a full render cannot bloc
 a new preview. Workers have a 25-second deadline. Eight encoded JPEG results are
 cached in memory with source path/size/mtime, canonical recipe and requested edge
 in the key; changing a recipe cannot reuse stale output. No derived files are
-written to the original archive. The cache is disposable on restart.
+written to the original archive. The cache is disposable on restart. A server-owned temporary directory also
+keeps two lossless reduced sRGB sources, keyed by source path, actual size/mtime
+and output edge. Slider changes reuse these oriented, flattened pixels before
+Gamma and Pop; source cache writes are atomic. Full-resolution pixels are not
+cached. Original archive files are never changed.
 
 Limitations: cancellation stops browser work but already-running server workers
 finish or time out. Busy render slots return an error rather than queueing work;
 adjust again to retry. Full images can be expensive to transfer and decode.
 There is no thumbnail endpoint yet; new thumbnails should use this same pipeline
 and saved recipe. Simultaneous editors use last successful save wins.
+
+
+Pop enhances floating-point Lab lightness at two scales, preserving the a/b
+colour channels. Gaussian sigma values are 3 and 22 pixels at a 1600-pixel long
+edge, scaled to the oriented output dimensions. Each detail plane uses smooth
+saturation (`d * limit / (limit + abs(d))`) and a soft noise gate
+(`abs(d) / (abs(d) + threshold)`). Fine/broad weights are 0.55/0.65,
+limits 5/8 and thresholds 1.5/2 Lab lightness units. Slider strength has a 3×
+gain: 33⅓ matches the original strength 100; the new maximum triples it.
+At strength 100 the added lightness stays below 23.85 units before sRGB gamut
+conversion. Existing saved Pop values also receive the stronger effect.
+Pop 0 bypasses all colour conversion and local contrast operations exactly.
+The reusable `local_contrast` helper is independent of recipe and transport.
+
+Processing order is orient/colour-manage → resize to requested output → flatten
+alpha → Gamma → Pop → JPEG. Wide blurs use reduced luminance planes with sigma
+at most 4, then interpolate to the target size. This avoids huge convolution
+kernels on 50MP sources. Lab and detail planes are materialized to prevent repeated
+work across branching vips expressions; full output therefore requires substantial
+memory. There is no crop operation. Resolution consistency is approximate near the
+0.5-pixel minimum sigma and for textures lost during preview downsampling.
+
+Development measurements before the 3× strength increase on this machine, with libvips 8 and two processing
+threads, using a synthetic 10000×5000 JPEG and Gamma 0.85: cold 1440px source/
+Gamma render 0.57s; warm-source Pop 40 preview 0.38s; Pop 100 preview 0.28s;
+full-resolution Pop 40 14.79s. These are single-run pipeline timings, excluding
+worker startup, HTTP, transfer and browser decode; real images and NUC hardware
+will vary. The existing 25-second worker deadline still applies.
+
+Tests cover legacy recipes, validation, persistence and HTTP rendering, exact
+Pop-zero JPEG equivalence, lossless preview cache reuse, original-file integrity,
+texture gain, brightness and edge bounds, neutral sky/skin/shadow colours, scaled
+output agreement, combined Save/Reset/Cancel, obsolete decoded renders and
+fullscreen session retention. Before the 3× strength increase, six available photographs were visually compared
+at Pop 0/40/100, covering portraits, foliage, brickwork, pale sky, indoor shadows
+and mountain/snow boundaries. Moderate strength adds subtle definition; maximum
+strength remains restrained in these examples. The soft gate is not a denoiser:
+strong noise can still be enhanced, and Lab-to-sRGB can clip out-of-gamut colours.
+Manual browser interaction and representative noisy modern 50MP photographs on
+the target NUC remain useful acceptance checks.
