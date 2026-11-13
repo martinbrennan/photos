@@ -406,3 +406,58 @@ requires the system ExifTool dependency installed above.
 Slideshow tests also cover HTTP endpoints, image rendering, source preservation,
 missing files, path boundaries, read-only enforcement and reads concurrent with a
 write transaction. HTTP tests need permission to bind a local loopback socket.
+
+## Non-destructive gamma editing
+
+Install the processing engine on Debian/Ubuntu (including the NUC):
+
+```sh
+sudo apt install libvips42
+pip install -r requirements.txt
+# Alternatively, a bundled libvips wheel is available on supported platforms:
+pip install 'pyvips[binary]>=3.0,<4'
+```
+
+The viewer's Edit button opens one panel inside the image stage, available in
+normal and fullscreen modes. Editing suspends slideshow navigation and its timer;
+leaving fullscreen keeps the unsaved settings. Save commits; Cancel restores the
+exact image displayed before editing; Reset previews gamma 1 without saving.
+A failed save leaves the panel open. Originals are never written.
+
+Gamma follows `output = input ** gamma` on normalized sRGB channels: values below
+1 lighten midtones. Libvips uses the reciprocal exponent, so the pipeline calls
+`gamma(exponent=1 / gamma)`. Both preview and full output use this pipeline.
+Embedded profiles are converted to sRGB, orientation is applied before display,
+and JPEG output strips source metadata. Untagged images are treated as sRGB.
+Neutral photographs retain the existing Pillow display path.
+
+On viewer startup, schema version 2 adds `photo_edits(photo_id, recipe, revision)`
+without changing photo records. Version 1 JSON recipes contain `version` and
+`gamma`; saves increment the revision and use the existing cooperative writer
+lock. A running scan/import can temporarily prevent a save; retry afterwards.
+The viewer therefore requires a writable catalogue for migration and saving.
+Image reading connections remain read-only. No source disk write access is needed.
+
+`GET /api/edits/{id}` reads a recipe; JSON `POST` to the same URL saves it.
+`GET /api/render/{id}?gamma=0.8&edge=1440` requests a bounded render; `edge=0`
+requests original dimensions (90MP safety ceiling). The central pipeline accepts
+an output edge and a versioned recipe; future effects belong there in a defined
+order, and region rendering can extend this contract. Gamma is the only enabled
+effect. `/photo/{id}` automatically applies saved recipes, including slideshow
+views and future consumers using that endpoint.
+
+Slider input coalesces for 60ms, requests a ~2MP square-bounded preview, then
+requests full resolution after 800ms of inactivity and preview completion.
+Decoded images replace the current blob without resetting CSS zoom/pan geometry.
+Abort controllers and generation checks prevent obsolete responses from displaying.
+Preview and full renders use separate worker slots, so a full render cannot block
+a new preview. Workers have a 25-second deadline. Eight encoded JPEG results are
+cached in memory with source path/size/mtime, canonical recipe and requested edge
+in the key; changing a recipe cannot reuse stale output. No derived files are
+written to the original archive. The cache is disposable on restart.
+
+Limitations: cancellation stops browser work but already-running server workers
+finish or time out. Busy render slots return an error rather than queueing work;
+adjust again to retry. Full images can be expensive to transfer and decode.
+There is no thumbnail endpoint yet; new thumbnails should use this same pipeline
+and saved recipe. Simultaneous editors use last successful save wins.

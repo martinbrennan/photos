@@ -13,11 +13,18 @@ except ImportError:
     pass
 
 
-def render(path, root):
+def render(path, root, recipe=None, edge=2560):
     path = Path(path)
     root = Path(root).resolve(strict=True)
     if path.is_symlink() or not path.resolve(strict=True).is_relative_to(root):
         raise ValueError('Photo is outside its source archive or is a symbolic link')
+    if recipe is not None:
+        from .editing import process
+        # Header-only check before processing full-resolution output.
+        with Image.open(path) as header:
+            if header.width * header.height > 90_000_000:
+                raise ValueError('Image exceeds the 90-megapixel limit')
+        return process(path, recipe, edge)
     # Reject unusually large images rather than risking memory exhaustion on the NUC.
     with Image.open(path) as image:
         if image.width * image.height > 90_000_000:
@@ -40,7 +47,7 @@ def render(path, root):
 if __name__ == '__main__':
     try:
         request = json.load(sys.stdin)
-        sys.stdout.buffer.write(render(request['path'], request['root']))
+        sys.stdout.buffer.write(render(request['path'], request['root'], request.get('recipe'), request.get('edge', 2560)))
     except Exception as exc:
         print(f'{type(exc).__name__}: {exc}', file=sys.stderr)
         sys.exit(1)

@@ -1,4 +1,4 @@
-"""Local slideshow server. Catalogue connections are strictly read-only."""
+"""Local viewer: read-only catalogue queries, explicit recipe writes."""
 import json
 import logging
 import random
@@ -14,6 +14,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image, ImageOps
+from .editing import recipe, canonical, DEFAULT
+from .database import connect
+from .locking import writer_lock
 
 try:
     from pillow_heif import register_heif_opener
@@ -38,7 +41,11 @@ def read_database(path):
 class PhotoStore:
     def __init__(self, database):
         self.database = Path(database).resolve()
+        # Migrate existing catalogues without touching their photo records.
+        with writer_lock(self.database), closing(connect(self.database)):
+            pass
         self.image_lock = threading.Lock()
+        self.full_lock = threading.Lock()
         self.failed = {}
         self.render_timeout = 25
         # Per-server cache, bounded to eight screen-sized JPEGs, never original pixels.
@@ -94,7 +101,25 @@ class PhotoStore:
                         'count': count, 'url': f"/photo/{row['id']}"}
         return None
 
-    def _render(self, path, root, size, mtime):
+    def edits(self, photo_id):
+        if self.photo(photo_id) is None:
+            raise FileNotFoundError('Photo is not in the catalogue')
+        with closing(read_database(self.database)) as db:
+            row = db.execute('SELECT recipe FROM photo_edits WHERE photo_id=?', (photo_id,)).fetchone()
+        return recipe(json.loads(row[0])) if row else dict(DEFAULT)
+
+    def save_edits(self, photo_id, value):
+        value = recipe(value)
+        if self.photo(photo_id) is None:
+            raise FileNotFoundError('Photo is not in the catalogue')
+        with writer_lock(self.database), closing(sqlite3.connect(self.database, timeout=5)) as db:
+            db.execute('INSERT INTO photo_edits(photo_id,recipe) VALUES (?,?) '
+                       'ON CONFLICT(photo_id) DO UPDATE SET recipe=excluded.recipe,revision=revision+1',
+                       (photo_id, canonical(value)))
+            db.commit()
+        return value
+
+    def _render(self, path, root, size, mtime, edits=None, edge=2560):
         # A native decoder can hold the GIL or hang on disk I/O. Keep it out of
         # the HTTP process, with a deadline that also kills/reaps the child.
         started = time.monotonic()
@@ -102,7 +127,7 @@ class PhotoStore:
             result = subprocess.run(
                 [sys.executable, '-m', 'catalogue.render_worker'],
                 cwd=Path(__file__).resolve().parent.parent,
-                input=json.dumps({'path': path, 'root': root}).encode(),
+                input=json.dumps({'path': path, 'root': root, 'recipe': json.loads(edits) if edits else None, 'edge': edge}).encode(),
                 capture_output=True, timeout=self.render_timeout)
         except subprocess.TimeoutExpired as exc:
             log.error('Photo rendering timed out after %.1fs: %s', time.monotonic() - started, path)
@@ -113,24 +138,29 @@ class PhotoStore:
         log.info('Rendered photo in %.2fs: %s', time.monotonic() - started, path)
         return result.stdout
 
-    def image(self, photo_id):
+    def image(self, photo_id, edits=None, edge=2560):
         row = self.photo(photo_id)
         if row is None:
             raise FileNotFoundError('Photo is not in the catalogue')
         # No USB I/O in the HTTP process; validation and decoding happen in the child.
         if Path(row['filename']).suffix.lower() not in SUPPORTED:
             raise ValueError('Unsupported photo format')
-        if not self.image_lock.acquire(timeout=.25):
+        saved = self.edits(photo_id) if edits is None else recipe(edits)
+        encoded = canonical(saved) if edits is not None or saved != DEFAULT else None
+        lock = self.full_lock if edge == 0 else self.image_lock
+        if not lock.acquire(timeout=.25):
             raise OSError('Another photograph is being rendered; retry shortly')
         try:
-            return self.render(row['full_path'], row['root_path'], row['file_size'], row['mtime_ns'])
+            return self.render(row['full_path'], row['root_path'], row['file_size'], row['mtime_ns'], encoded, edge)
         except (OSError, ValueError):
+            if edits is not None:
+                raise
             if len(self.failed) >= 512:
                 self.failed.pop(next(iter(self.failed)))
             self.failed[photo_id] = time.monotonic() + 300
             raise
         finally:
-            self.image_lock.release()
+            lock.release()
 
 
 def make_server(database, host='127.0.0.1', port=8765, interval=10):
@@ -153,6 +183,27 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
 
         def json(self, status, value):
             self.reply(status, json.dumps(value).encode(), 'application/json; charset=utf-8')
+
+        def do_POST(self):
+            try:
+                # JSON-only, same-origin writes; reject cross-origin browser submissions.
+                if self.headers.get('Sec-Fetch-Site') == 'cross-site' or self.headers.get('Content-Type') != 'application/json':
+                    self.json(403, {'error': 'Same-origin JSON required'})
+                    return
+                parts = urlsplit(self.path).path.split('/')
+                if len(parts) != 4 or parts[1:3] != ['api', 'edits'] or not parts[3].isdigit():
+                    self.json(404, {'error': 'Not found'})
+                    return
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 4096:
+                    raise ValueError('Invalid request size')
+                self.json(200, store.save_edits(int(parts[3]), json.loads(self.rfile.read(length))))
+            except (ValueError, TypeError) as exc:
+                self.json(400, {'error': str(exc)})
+            except FileNotFoundError:
+                self.json(404, {'error': 'Photo not found'})
+            except sqlite3.Error:
+                self.json(503, {'error': 'Could not save edits; retry shortly'})
 
         def do_GET(self):
             try:
@@ -180,6 +231,19 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
                     else:
                         photo = store.adjacent(int(value), direction)
                         self.json(200, photo if photo else {'end': True})
+                elif url.path.startswith('/api/edits/') and url.path[11:].isdigit():
+                    self.json(200, store.edits(int(url.path[11:])))
+                elif url.path.startswith('/api/render/') and url.path[12:].isdigit():
+                    query = parse_qs(url.query)
+                    try:
+                        edits = recipe({'version': 1, 'gamma': float(query.get('gamma', ['1'])[0])})
+                        edge = int(query.get('edge', ['1440'])[0])
+                        if edge != 0 and not 64 <= edge <= 4096:
+                            raise ValueError('Invalid output size')
+                    except ValueError as exc:
+                        self.json(400, {'error': str(exc)})
+                        return
+                    self.reply(200, store.image(int(url.path[12:]), edits, edge), 'image/jpeg')
                 elif url.path.startswith('/photo/') and url.path[7:].isdigit():
                     self.reply(200, store.image(int(url.path[7:])), 'image/jpeg')
                 else:

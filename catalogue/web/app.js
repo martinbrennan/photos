@@ -2,6 +2,8 @@
 const $ = id => document.getElementById(id);
 let playing = true, busy = false, timer = null, previous = null, objectURL = null;
 let seconds = 10, active = null, generation = 0;
+let editing = false, savedRecipe = {version:1, gamma:1}, editSequence = 0;
+let previewTimer, highTimer, previewController, highController, sessionURL = null;
 const history = [];
 const photoZoom = createPhotoZoom($('stage'), $('photo'));
 function updateControls() {
@@ -11,7 +13,7 @@ function updateControls() {
 }
 function schedule(delay = seconds * 1000) {
   clearTimeout(timer);
-  if (playing) timer = setTimeout(next, delay);
+  if (playing && !editing) timer = setTimeout(next, delay);
 }
 function toggle() {
   playing = !playing;
@@ -20,8 +22,10 @@ function toggle() {
   if (playing) schedule(); else clearTimeout(timer);
 }
 async function next(mode = 'random') {
+  if (editing) return;
   if (mode === 'back' && history.length < 2) return;
   if (['next', 'previous'].includes(mode) && previous === null) return;
+  stopRenders();
   if (active) active.abort();
   const request = ++generation;
   const controller = new AbortController();
@@ -78,6 +82,7 @@ async function next(mode = 'random') {
     if (mode === 'back') history.pop();
     else history.push(data);
     previous = data.id;
+    $('edit').disabled = false;
     updateControls();
     success = true;
   } catch (error) {
@@ -123,6 +128,96 @@ document.addEventListener('keydown', event => {
   if (event.key.toLowerCase() === 'r') next();
   if (event.key.toLowerCase() === 'f') fullscreen();
 });
+
+function stopRenders() {
+  ++editSequence;
+  clearTimeout(previewTimer); clearTimeout(highTimer);
+  if (previewController) previewController.abort();
+  if (highController) highController.abort();
+}
+async function renderEdit(value, edge, sequence) {
+  const controller = new AbortController();
+  if (edge) previewController = controller; else highController = controller;
+  let url;
+  try {
+    const response = await fetch(`/api/render/${previous}?gamma=${value}&edge=${edge}`, {signal:controller.signal});
+    if (!response.ok) throw new Error('Render unavailable. Check pyvips installation or try again.');
+    url = URL.createObjectURL(await response.blob());
+    const image = new Image(); image.src = url;
+    await image.decode();
+    if (sequence !== editSequence || controller.signal.aborted) return;
+    // Keep the existing CSS geometry and pan transform across resolution swaps.
+    $('photo').src = url;
+    if (objectURL && objectURL !== sessionURL) URL.revokeObjectURL(objectURL);
+    objectURL = url; url = null;
+    $('edit-status').textContent = edge ? 'Preview ready · refining…' : 'Full resolution ready';
+  } catch (error) {
+    if (sequence === editSequence && !controller.signal.aborted) $('edit-status').textContent = error.message;
+  } finally { if (url) URL.revokeObjectURL(url); }
+}
+function adjust() {
+  stopRenders();
+  const sequence = editSequence, value = Number($('gamma').value);
+  $('gamma-value').textContent = value.toFixed(2);
+  $('edit-status').textContent = 'Rendering preview…';
+  // Coalesce rapid input; high resolution starts only after preview completes.
+  const preview = new Promise(resolve => {
+    previewTimer = setTimeout(async () => { await renderEdit(value, 1440, sequence); resolve(); }, 60);
+  });
+  highTimer = setTimeout(async () => {
+    await preview;
+    if (sequence === editSequence) renderEdit(value, 0, sequence);
+  }, 800);
+}
+function closeEditor() {
+  if (sessionURL && sessionURL !== objectURL) URL.revokeObjectURL(sessionURL);
+  sessionURL = null;
+  editing = false; $('editor').hidden = true; $('edit').disabled = false;
+  $('save-edit').disabled = false; $('cancel-edit').disabled = false;
+  schedule();
+}
+$('edit').onclick = async () => {
+  if (busy || editing || previous === null) return;
+  editing = true; clearTimeout(timer); $('edit').disabled = true;
+  try {
+    const response = await fetch('/api/edits/' + previous);
+    if (!response.ok) throw new Error('Could not load saved edits');
+    savedRecipe = await response.json();
+    sessionURL = objectURL;
+    $('gamma').value = savedRecipe.gamma;
+    $('gamma-value').textContent = Number(savedRecipe.gamma).toFixed(2);
+    $('edit-status').textContent = '';
+    $('editor').hidden = false;
+  } catch (error) { closeEditor(); $('hint').textContent = error.message; }
+};
+$('gamma').oninput = adjust;
+$('reset-edit').onclick = () => { $('gamma').value = 1; adjust(); };
+$('cancel-edit').onclick = async () => {
+  stopRenders();
+  $('save-edit').disabled = true; $('cancel-edit').disabled = true;
+  if (objectURL && objectURL !== sessionURL) URL.revokeObjectURL(objectURL);
+  objectURL = sessionURL; $('photo').src = sessionURL;
+  closeEditor();
+};
+$('save-edit').onclick = async () => {
+  $('save-edit').disabled = true; $('cancel-edit').disabled = true;
+  try {
+    const response = await fetch('/api/edits/' + previous, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({version:1,gamma:Number($('gamma').value)})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not save edits');
+    savedRecipe = data;
+    // A quick Save must still display the committed value before leaving editing.
+    stopRenders();
+    await renderEdit(data.gamma, 1440, editSequence);
+    renderEdit(data.gamma, 0, editSequence);
+    closeEditor();
+  } catch (error) {
+    $('edit-status').textContent = error.message;
+    $('save-edit').disabled = false; $('cancel-edit').disabled = false;
+  }
+};
+
 updateControls();
 (async () => {
   try {

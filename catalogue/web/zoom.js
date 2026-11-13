@@ -71,6 +71,7 @@ function createPhotoZoom(stage, photo) {
     });
   }
   stage.addEventListener('wheel', event => {
+    if (event.target && event.target !== photo && event.target !== stage) return;
     if (!width || !height || event.ctrlKey || !event.deltaY) return;
     event.preventDefault();
     // Apply every delta, including high-resolution wheels and trackpads.

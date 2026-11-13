@@ -31,4 +31,9 @@ CREATE INDEX IF NOT EXISTS photos_chronological ON photos(chronological_at);
 CREATE INDEX IF NOT EXISTS photos_capture_local ON photos(captured_local);
 CREATE INDEX IF NOT EXISTS photos_capture_utc ON photos(captured_utc);
 CREATE INDEX IF NOT EXISTS photos_archive ON photos(archive_id);
-PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS photo_edits (
+    photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    recipe TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1
+);
+PRAGMA user_version = 2;
