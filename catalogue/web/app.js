@@ -67,7 +67,7 @@ async function next(mode = 'random') {
     objectURL = nextURL;
     $('photo').alt = data.filename;
     $('photo').style.display = 'block';
-    photoZoom.reset(preload.naturalWidth, preload.naturalHeight);
+    photoZoom.reset(preload.naturalWidth, preload.naturalHeight, document.fullscreenElement === $('stage'));
     $('placeholder').hidden = true;
     $('filename').textContent = data.filename;
     $('path').textContent = data.path;
@@ -113,10 +113,12 @@ $('interval').onchange = () => {
   schedule();
 };
 document.addEventListener('keydown', event => {
-  if (['INPUT', 'BUTTON', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
-  if (event.code === 'Space') { event.preventDefault(); toggle(); }
+  const focused = document.activeElement;
+  if (focused && (['INPUT', 'TEXTAREA', 'SELECT'].includes(focused.tagName) || focused.isContentEditable)) return;
   if (event.code === 'ArrowRight') { event.preventDefault(); next('next'); }
   if (event.code === 'ArrowLeft') { event.preventDefault(); next('previous'); }
+  if (focused && focused.tagName === 'BUTTON') return;
+  if (event.code === 'Space') { event.preventDefault(); toggle(); }
   if (event.key.toLowerCase() === 'b') next('back');
   if (event.key.toLowerCase() === 'r') next();
   if (event.key.toLowerCase() === 'f') fullscreen();

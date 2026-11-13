@@ -248,10 +248,14 @@ remembered interval takes precedence over the initial `--interval` value.
 
 In either the normal or fullscreen image view, scroll up over the image to
 zoom in about the cursor, and scroll down to zoom out. Four wheel notches double
-the magnification. Zoom ranges from fit-to-window to two physical screen pixels
-per displayed preview pixel (four screen pixels in area); fit takes precedence
+the magnification. Zoom ranges from fit-to-window to eight physical screen pixels
+per displayed preview pixel (64 screen pixels in area); fit takes precedence
 if a small image already needs greater enlargement. Previews remain limited to
-2560 pixels per side. Changing image or resizing the view resets zoom to fit.
+2560 pixels per side. Left-click and drag a magnified image to pan. Panning stops at the image edges;
+any axis smaller than the view stays centred. Changing image or resizing the
+view resets zoom to fit, except that changing images in fullscreen preserves
+the zoom and pan position, clamped to the new image’s bounds. Left/Right arrow
+keys navigate chronologically in both views, including when a button has focus.
 
 The viewer reads the catalogue using SQLite `mode=ro` and `query_only`. It never
 runs schema setup or writes catalogue records. WAL allows the ongoing scan to
