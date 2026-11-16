@@ -2,6 +2,8 @@
 import json
 import logging
 import random
+import select
+import socket
 import sqlite3
 import threading
 import subprocess
@@ -39,6 +41,10 @@ def read_database(path):
 
 
 
+class RenderCancelled(Exception):
+    """The browser no longer needs this result."""
+
+
 class PhotoStore:
     def __init__(self, database):
         self.database = Path(database).resolve()
@@ -47,8 +53,10 @@ class PhotoStore:
             pass
         self.image_lock = threading.Lock()
         self.full_lock = threading.Lock()
+        self.request_context = threading.local()
         self.failed = {}
         self.render_timeout = 25
+        self.drama_render_timeout = 60
         self.source_cache = tempfile.TemporaryDirectory(prefix="popeye-preview-")
         # Per-server cache, bounded to eight screen-sized JPEGs, never original pixels.
         self.render = lru_cache(maxsize=8)(self._render)
@@ -125,12 +133,41 @@ class PhotoStore:
         # A native decoder can hold the GIL or hang on disk I/O. Keep it out of
         # the HTTP process, with a deadline that also kills/reaps the child.
         started = time.monotonic()
+        value = json.loads(edits) if edits else None
+        timeout = self.render_timeout
+        if edge == 0 and value and value.get('drama', {}).get('strength', 0):
+            timeout = self.drama_render_timeout
         try:
-            result = subprocess.run(
-                [sys.executable, '-m', 'catalogue.render_worker'],
-                cwd=Path(__file__).resolve().parent.parent,
-                input=json.dumps({'path': path, 'root': root, 'recipe': json.loads(edits) if edits else None, 'edge': edge, 'source_cache': self.source_cache.name}).encode(),
-                capture_output=True, timeout=self.render_timeout)
+            command = [sys.executable, '-m', 'catalogue.render_worker']
+            payload = json.dumps({'path': path, 'root': root, 'recipe': value, 'edge': edge,
+                                  'source_cache': self.source_cache.name}).encode()
+            cwd = Path(__file__).resolve().parent.parent
+            cancelled = getattr(self.request_context, 'cancelled', None)
+            if cancelled is None:
+                result = subprocess.run(command, cwd=cwd, input=payload,
+                                        capture_output=True, timeout=timeout)
+            else:
+                # communicate drains stdout while checking for an abandoned browser
+                # request. Always kill AND reap obsolete native workers.
+                with subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) as worker:
+                    try:
+                        while True:
+                            if cancelled():
+                                raise RenderCancelled()
+                            remaining = timeout - (time.monotonic() - started)
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(command, timeout)
+                            try:
+                                output, errors = worker.communicate(payload, timeout=min(.1, remaining))
+                                break
+                            except subprocess.TimeoutExpired:
+                                payload = None
+                        result = subprocess.CompletedProcess(command, worker.returncode, output, errors)
+                    finally:
+                        if worker.poll() is None:
+                            worker.kill()
+                        worker.communicate()
         except subprocess.TimeoutExpired as exc:
             log.error('Photo rendering timed out after %.1fs: %s', time.monotonic() - started, path)
             raise OSError('Photo rendering timed out') from exc
@@ -150,9 +187,19 @@ class PhotoStore:
         saved = self.edits(photo_id) if edits is None else recipe(edits)
         encoded = canonical(saved) if edits is not None or saved != DEFAULT else None
         lock = self.full_lock if edge == 0 else self.image_lock
-        if not lock.acquire(timeout=.25):
+        cancelled = getattr(self.request_context, 'cancelled', None)
+        if edits is not None and cancelled is not None:
+            # Obsolete requests leave this queue as soon as their fetch is aborted.
+            while True:
+                if cancelled():
+                    raise RenderCancelled()
+                if lock.acquire(timeout=.1):
+                    break
+        elif not lock.acquire(timeout=.25):
             raise OSError('Another photograph is being rendered; retry shortly')
         try:
+            if cancelled is not None and cancelled():
+                raise RenderCancelled()
             return self.render(row['full_path'], row['root_path'], row['file_size'], row['mtime_ns'], encoded, edge)
         except (OSError, ValueError):
             if edits is not None:
@@ -173,7 +220,28 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
         db.execute('SELECT id FROM photos LIMIT 1').fetchone()
 
     class Handler(BaseHTTPRequestHandler):
+        def disconnected(self):
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                return bool(readable) and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            except (ConnectionError, OSError):
+                return True
+
+        def render_image(self, photo_id, edits, edge):
+            store.request_context.cancelled = self.disconnected
+            try:
+                return store.image(photo_id, edits, edge)
+            finally:
+                del store.request_context.cancelled
+
         def reply(self, status, content, kind):
+            # An error response can itself race a browser cancelling its fetch.
+            try:
+                self.write_reply(status, content, kind)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+
+        def write_reply(self, status, content, kind):
             self.send_response(status)
             self.send_header('Content-Type', kind)
             self.send_header('Content-Length', str(len(content)))
@@ -239,19 +307,21 @@ def make_server(database, host='127.0.0.1', port=8765, interval=10):
                     query = parse_qs(url.query)
                     try:
                         edits = recipe({'version': 1, 'gamma': float(query.get('gamma', ['1'])[0]),
-                                        'pop': float(query.get('pop', ['0'])[0])})
+                                        'pop': float(query.get('pop', ['0'])[0]),
+                                        'drama': {'strength': float(query.get('drama', ['0'])[0]),
+                                                  'saturation': float(query.get('drama_saturation', ['0'])[0])}})
                         edge = int(query.get('edge', ['1440'])[0])
                         if edge != 0 and not 64 <= edge <= 4096:
                             raise ValueError('Invalid output size')
                     except ValueError as exc:
                         self.json(400, {'error': str(exc)})
                         return
-                    self.reply(200, store.image(int(url.path[12:]), edits, edge), 'image/jpeg')
+                    self.reply(200, self.render_image(int(url.path[12:]), edits, edge), 'image/jpeg')
                 elif url.path.startswith('/photo/') and url.path[7:].isdigit():
                     self.reply(200, store.image(int(url.path[7:])), 'image/jpeg')
                 else:
                     self.json(404, {'error': 'Not found'})
-            except (BrokenPipeError, ConnectionResetError):
+            except (RenderCancelled, BrokenPipeError, ConnectionResetError):
                 pass
             except (FileNotFoundError, ValueError):
                 self.json(404, {'error': 'Photo unavailable; trying another.'})

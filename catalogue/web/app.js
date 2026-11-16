@@ -2,8 +2,10 @@
 const $ = id => document.getElementById(id);
 let playing = true, busy = false, timer = null, previous = null, objectURL = null;
 let seconds = 10, active = null, generation = 0;
-let editing = false, savedRecipe = {version:1, gamma:1, pop:0}, editSequence = 0;
+let editing = false, savedRecipe = {version:1, gamma:1, pop:0, drama:{strength:0,saturation:0}}, editSequence = 0;
+let copiedRecipe = null;
 let previewTimer, highTimer, previewController, highController, sessionURL = null;
+let comparing = false, originalURL = null, originalRequest = null;
 const history = [];
 const photoZoom = createPhotoZoom($('stage'), $('photo'));
 function updateControls() {
@@ -13,7 +15,7 @@ function updateControls() {
 }
 function schedule(delay = seconds * 1000) {
   clearTimeout(timer);
-  if (playing && !editing) timer = setTimeout(next, delay);
+  if (playing && !editing && !comparing) timer = setTimeout(next, delay);
 }
 function toggle() {
   playing = !playing;
@@ -25,6 +27,9 @@ async function next(mode = 'random') {
   if (editing) return;
   if (mode === 'back' && history.length < 2) return;
   if (['next', 'previous'].includes(mode) && previous === null) return;
+  endComparison();
+  if (originalURL) URL.revokeObjectURL(originalURL);
+  originalURL = null;
   stopRenders();
   if (active) active.abort();
   const request = ++generation;
@@ -77,8 +82,6 @@ async function next(mode = 'random') {
     $('path').textContent = data.path;
     $('date').textContent = data.date ? data.date.replace(/\.\d+$/, '') : 'CAPTURE DATE UNKNOWN';
     $('camera').textContent = data.camera;
-    $('collection').textContent = Number(data.count).toLocaleString() + ' photographs catalogued';
-    $('hint').textContent = 'Scroll down/up to zoom · Space to pause · ←/→ chronological · B back · R random · F fullscreen';
     if (mode === 'back') history.pop();
     else history.push(data);
     previous = data.id;
@@ -122,12 +125,51 @@ document.addEventListener('keydown', event => {
   if (focused && (['INPUT', 'TEXTAREA', 'SELECT'].includes(focused.tagName) || focused.isContentEditable)) return;
   if (event.code === 'ArrowRight') { event.preventDefault(); next('next'); }
   if (event.code === 'ArrowLeft') { event.preventDefault(); next('previous'); }
+  if (event.code === 'Space') { event.preventDefault(); if (!event.repeat) showOriginal(); return; }
   if (focused && focused.tagName === 'BUTTON') return;
-  if (event.code === 'Space') { event.preventDefault(); toggle(); }
   if (event.key.toLowerCase() === 'b') next('back');
   if (event.key.toLowerCase() === 'r') next();
   if (event.key.toLowerCase() === 'f') fullscreen();
 });
+
+document.addEventListener('keyup', event => {
+  if (event.code === 'Space') { event.preventDefault(); endComparison(); }
+});
+// Releasing focus must never leave the photograph stuck on the original.
+if (typeof window !== 'undefined') window.addEventListener('blur', endComparison);
+document.addEventListener('visibilitychange', () => { if (document.hidden) endComparison(); });
+async function showOriginal() {
+  if (comparing || busy || previous === null) return;
+  comparing = true;
+  clearTimeout(timer);
+  if (originalURL) { $('photo').src = originalURL; return; }
+  const controller = new AbortController();
+  originalRequest = controller;
+  const photoID = previous;
+  let url;
+  try {
+    const response = await fetch(`/api/render/${photoID}?gamma=1&pop=0&drama=0&drama_saturation=0&edge=2560`, {signal:controller.signal});
+    if (!response.ok) throw new Error('Original preview unavailable');
+    url = URL.createObjectURL(await response.blob());
+    const image = new Image(); image.src = url;
+    await image.decode();
+    if (controller.signal.aborted || previous !== photoID) return;
+    originalURL = url; url = null;
+    if (comparing) $('photo').src = originalURL;
+  } catch (error) {
+    if (!controller.signal.aborted) { $('hint').textContent = error.message; endComparison(); }
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+    if (originalRequest === controller) originalRequest = null;
+  }
+}
+function endComparison() {
+  if (originalRequest) originalRequest.abort();
+  if (!comparing) return;
+  comparing = false;
+  if (objectURL) $('photo').src = objectURL;
+  schedule();
+}
 
 function stopRenders() {
   ++editSequence;
@@ -140,37 +182,42 @@ async function renderEdit(value, edge, sequence) {
   if (edge) previewController = controller; else highController = controller;
   let url;
   try {
-    const response = await fetch(`/api/render/${previous}?gamma=${value.gamma}&pop=${value.pop}&edge=${edge}`, {signal:controller.signal});
-    if (!response.ok) throw new Error('Render unavailable. Check pyvips installation or try again.');
+    const response = await fetch(`/api/render/${previous}?gamma=${value.gamma}&pop=${value.pop}&drama=${value.drama?.strength ?? 0}&drama_saturation=${value.drama?.saturation ?? 0}&edge=${edge}`, {signal:controller.signal});
+    if (!response.ok) throw new Error('Could not render these settings. Try adjusting again.');
     url = URL.createObjectURL(await response.blob());
     const image = new Image(); image.src = url;
     await image.decode();
-    if (sequence !== editSequence || controller.signal.aborted) return;
+    if (sequence !== editSequence || controller.signal.aborted) return false;
     // Keep the existing CSS geometry and pan transform across resolution swaps.
-    $('photo').src = url;
+    if (!comparing) $('photo').src = url;
     if (objectURL && objectURL !== sessionURL) URL.revokeObjectURL(objectURL);
     objectURL = url; url = null;
-    $('edit-status').textContent = edge ? 'Preview ready · refining…' : 'Full resolution ready';
+    $('edit-status').textContent = '';
+    return true;
   } catch (error) {
     if (sequence === editSequence && !controller.signal.aborted) $('edit-status').textContent = error.message;
+    return false;
   } finally { if (url) URL.revokeObjectURL(url); }
 }
 function currentRecipe() {
-  return {version:1, gamma:Number($('gamma').value), pop:Number($('pop').value)};
+  return {version:1, gamma:Number($('gamma').value), pop:Number($('pop').value),
+    drama:{strength:Number($('drama').value), saturation:Number($('drama-saturation').value)}};
 }
 function adjust() {
   stopRenders();
   const sequence = editSequence, value = currentRecipe();
   $('gamma-value').textContent = value.gamma.toFixed(2);
   $('pop-value').textContent = value.pop;
+  $('drama-value').textContent = value.drama.strength;
+  $('drama-saturation-value').textContent = value.drama.saturation;
   $('edit-status').textContent = 'Rendering preview…';
   // Coalesce rapid input; high resolution starts only after preview completes.
   const preview = new Promise(resolve => {
-    previewTimer = setTimeout(async () => { await renderEdit(value, 1440, sequence); resolve(); }, 60);
+    previewTimer = setTimeout(async () => { resolve(await renderEdit(value, 1440, sequence)); }, 60);
   });
   highTimer = setTimeout(async () => {
-    await preview;
-    if (sequence === editSequence) renderEdit(value, 0, sequence);
+    const ready = await preview;
+    if (ready && sequence === editSequence) renderEdit(value, 0, sequence);
   }, 800);
 }
 function closeEditor() {
@@ -178,7 +225,9 @@ function closeEditor() {
   sessionURL = null;
   editing = false; $('editor').hidden = true; $('edit').disabled = false;
   $('save-edit').disabled = false; $('cancel-edit').disabled = false;
+  $('copy-edit').disabled = false; $('paste-edit').disabled = !copiedRecipe;
   $('gamma').disabled = false; $('pop').disabled = false; $('reset-edit').disabled = false;
+  $('drama').disabled = false; $('drama-saturation').disabled = false;
   schedule();
 }
 $('edit').onclick = async () => {
@@ -191,6 +240,10 @@ $('edit').onclick = async () => {
     sessionURL = objectURL;
     $('gamma').value = savedRecipe.gamma;
     $('pop').value = savedRecipe.pop ?? 0;
+    $('drama').value = savedRecipe.drama?.strength ?? 0;
+    $('drama-saturation').value = savedRecipe.drama?.saturation ?? 0;
+    $('drama-value').textContent = $('drama').value;
+    $('drama-saturation-value').textContent = $('drama-saturation').value;
     $('pop-value').textContent = savedRecipe.pop ?? 0;
     $('gamma-value').textContent = Number(savedRecipe.gamma).toFixed(2);
     $('edit-status').textContent = '';
@@ -199,18 +252,38 @@ $('edit').onclick = async () => {
 };
 $('gamma').oninput = adjust;
 $('pop').oninput = adjust;
-$('reset-edit').onclick = () => { $('gamma').value = 1; $('pop').value = 0; adjust(); };
+$('drama').oninput = adjust;
+$('drama-saturation').oninput = adjust;
+$('copy-edit').onclick = () => {
+  if (!editing || $('save-edit').disabled) return;
+  copiedRecipe = currentRecipe();
+  $('paste-edit').disabled = false;
+  $('edit-status').textContent = 'Edit settings copied';
+};
+$('paste-edit').onclick = () => {
+  if (!editing || $('save-edit').disabled || !copiedRecipe) return;
+  $('gamma').value = copiedRecipe.gamma;
+  $('pop').value = copiedRecipe.pop;
+  $('drama').value = copiedRecipe.drama.strength;
+  $('drama-saturation').value = copiedRecipe.drama.saturation;
+  adjust();
+};
+$('reset-edit').onclick = () => { $('gamma').value = 1; $('pop').value = 0; $('drama').value = 0; $('drama-saturation').value = 0; adjust(); };
 $('cancel-edit').onclick = async () => {
   stopRenders();
   $('save-edit').disabled = true; $('cancel-edit').disabled = true;
+  $('copy-edit').disabled = true; $('paste-edit').disabled = true;
   $('gamma').disabled = true; $('pop').disabled = true; $('reset-edit').disabled = true;
+  $('drama').disabled = true; $('drama-saturation').disabled = true;
   if (objectURL && objectURL !== sessionURL) URL.revokeObjectURL(objectURL);
-  objectURL = sessionURL; $('photo').src = sessionURL;
+  objectURL = sessionURL; if (!comparing) $('photo').src = sessionURL;
   closeEditor();
 };
 $('save-edit').onclick = async () => {
   $('save-edit').disabled = true; $('cancel-edit').disabled = true;
+  $('copy-edit').disabled = true; $('paste-edit').disabled = true;
   $('gamma').disabled = true; $('pop').disabled = true; $('reset-edit').disabled = true;
+  $('drama').disabled = true; $('drama-saturation').disabled = true;
   try {
     const response = await fetch('/api/edits/' + previous, {method:'POST',
       headers:{'Content-Type':'application/json'}, body:JSON.stringify(currentRecipe())});
@@ -219,13 +292,17 @@ $('save-edit').onclick = async () => {
     savedRecipe = data;
     // A quick Save must still display the committed value before leaving editing.
     stopRenders();
-    await renderEdit(data, 1440, editSequence);
+    if (!await renderEdit(data, 1440, editSequence)) {
+      throw new Error('Settings saved, but the preview could not be updated. Try Save again.');
+    }
     renderEdit(data, 0, editSequence);
     closeEditor();
   } catch (error) {
     $('edit-status').textContent = error.message;
     $('save-edit').disabled = false; $('cancel-edit').disabled = false;
+  $('copy-edit').disabled = false; $('paste-edit').disabled = !copiedRecipe;
     $('gamma').disabled = false; $('pop').disabled = false; $('reset-edit').disabled = false;
+    $('drama').disabled = false; $('drama-saturation').disabled = false;
   }
 };
 

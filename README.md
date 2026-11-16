@@ -240,7 +240,7 @@ advance manually, or use fullscreen. Back retraces successfully displayed images
 in this tab's session. Previous Image and Next Image navigate chronologically
 (using the catalogue's modification-time fallback for unknown capture dates),
 stopping at either end; matching dates are ordered by photo ID. Next Random and
-automatic playback choose random images. Space pauses, Left/Right navigate
+automatic playback choose random images. Hold Space to view the unedited photograph; release it to restore the current edits. Left/Right navigate
 chronologically, B goes back, R chooses randomly, and F opens fullscreen when
 focus is outside a control. The interval is measured after
 the photo finishes loading; the browser remembers changes on this device. A
@@ -407,7 +407,7 @@ Slideshow tests also cover HTTP endpoints, image rendering, source preservation,
 missing files, path boundaries, read-only enforcement and reads concurrent with a
 write transaction. HTTP tests need permission to bind a local loopback socket.
 
-## Non-destructive Gamma and Pop editing
+## Non-destructive Gamma, Pop and Drama editing
 
 Install the processing engine on Debian/Ubuntu (including the NUC):
 
@@ -421,7 +421,7 @@ pip install 'pyvips[binary]>=3.0,<4'
 The viewer's Edit button opens one panel inside the image stage, available in
 normal and fullscreen modes. Editing suspends slideshow navigation and its timer;
 leaving fullscreen keeps the unsaved settings. Save commits; Cancel restores the
-exact image displayed before editing; Reset previews Gamma 1 and Pop 0 without saving.
+exact image displayed before editing; Reset previews Gamma 1, Pop 0 and Drama strength/saturation 0 without saving.
 A failed save leaves the panel open. Originals are never written.
 
 Gamma follows `output = input ** gamma` on normalized sRGB channels: values below
@@ -433,7 +433,8 @@ Neutral photographs retain the existing Pillow display path.
 
 On viewer startup, schema version 2 adds `photo_edits(photo_id, recipe, revision)`
 without changing photo records. Version 1 JSON recipes contain `version` and
-`gamma` and `pop` (0–100, default 0); old Gamma-only recipes remain valid.
+`gamma`, `pop` (0–100, default 0), and `drama` (strength/saturation);
+old Gamma-only and Gamma/Pop recipes remain valid.
 Saves increment the revision and use the existing cooperative writer
 lock. A running scan/import can temporarily prevent a save; retry afterwards.
 The viewer therefore requires a writable catalogue for migration and saving.
@@ -443,15 +444,20 @@ Image reading connections remain read-only. No source disk write access is neede
 `GET /api/render/{id}?gamma=0.8&pop=40&edge=1440` requests a bounded render; `edge=0`
 requests original dimensions (90MP safety ceiling). The central pipeline accepts
 an output edge and a versioned recipe; future effects belong there in a defined
-order, and region rendering can extend this contract. Gamma runs first, followed by Pop. `/photo/{id}` automatically applies saved recipes, including slideshow
+order, and region rendering can extend this contract. Gamma runs first, followed by Pop, then Drama. `/photo/{id}` automatically applies saved recipes, including slideshow
 views and future consumers using that endpoint.
 
 Slider input coalesces for 60ms, requests a ~2MP square-bounded preview, then
-requests full resolution after 800ms of inactivity and preview completion.
+requests full resolution after 800ms of inactivity and successful preview completion.
 Decoded images replace the current blob without resetting CSS zoom/pan geometry.
 Abort controllers and generation checks prevent obsolete responses from displaying.
+The server checks abandoned edit connections every 100ms, kills and reaps their
+render workers, and releases their slots. Pending previews wait quietly for a slot;
+cancelled requests leave the queue without rendering. Normal cancellation and
+disconnected response writes produce no tracebacks; genuine render failures remain visible.
 Preview and full renders use separate worker slots, so a full render cannot block
-a new preview. Workers have a 25-second deadline. Eight encoded JPEG results are
+a new preview. Workers have a 25-second deadline, extended to 60 seconds for
+full-resolution renders with Drama enabled. Eight encoded JPEG results are
 cached in memory with source path/size/mtime, canonical recipe and requested edge
 in the key; changing a recipe cannot reuse stale output. No derived files are
 written to the original archive. The cache is disposable on restart. A server-owned temporary directory also
@@ -480,7 +486,7 @@ Pop 0 bypasses all colour conversion and local contrast operations exactly.
 The reusable `local_contrast` helper is independent of recipe and transport.
 
 Processing order is orient/colour-manage → resize to requested output → flatten
-alpha → Gamma → Pop → JPEG. Wide blurs use reduced luminance planes with sigma
+alpha → Gamma → Pop → Drama → JPEG. Wide blurs use reduced luminance planes with sigma
 at most 4, then interpolate to the target size. This avoids huge convolution
 kernels on 50MP sources. Lab and detail planes are materialized to prevent repeated
 work across branching vips expressions; full output therefore requires substantial
@@ -505,3 +511,63 @@ strength remains restrained in these examples. The soft gate is not a denoiser:
 strong noise can still be enhanced, and Lab-to-sRGB can clip out-of-gamut colours.
 Manual browser interaction and representative noisy modern 50MP photographs on
 the target NUC remain useful acceptance checks.
+
+
+### Drama
+
+The editor exposes Drama Strength (0–100, default 0) and Drama Saturation
+(-100–100, default 0) in the same scrollable panel inside the normal/fullscreen
+image stage. Save, Cancel and unsaved Reset apply to every adjustment.
+Recipes retain version 1 and the numeric Pop format, adding:
+
+```json
+{"version":1,"gamma":0.85,"pop":30,"drama":{"strength":50,"saturation":-20}}
+```
+
+Missing Drama parameters default to zero. Render requests append `drama=50` and
+`drama_saturation=-20`. Canonical cache keys include both values; reduced source
+pixels remain independent of every adjustment. Strength zero returns the stage
+input exactly, including when saturation is nonzero. Originals are never written.
+The processing order is Gamma → Pop → Drama at each requested output resolution.
+
+Drama works on floating-point Lab lightness. It shares `scaled_blur` and
+`bounded_detail` with Pop, preserving Pop's existing arithmetic and 3× strength.
+Three contrast scales use sigma 3/20/60 at a reference long edge of 1600 pixels,
+weights 0.65/1.2/1.1, soft detail limits 5/9/12, and noise thresholds 2/2.5/3.
+The broad luminance map also drives local base compression, adding
+`0.30 * (50 - broad)` to lift locally dark regions and compress bright regions.
+A smooth `L*(100-L)/2500` envelope protects black/white endpoints. Strength/100
+scales the entire lightness change before constraining L to 0–100. Chroma is
+multiplied by `1 + strength/100 * saturation/100`: -100 gives monochrome at
+full strength, while 0 leaves Lab chroma unchanged. At partial strength even
+full desaturation blends gradually. The `drama(..., style="natural")` function
+reserves a preset argument; no additional presets or recipe style field exist.
+
+Single-run measurements on a synthetic 50MP JPEG (10000×5000), libvips 8,
+two threads, Gamma 0.85: cold neutral 1440px render 0.22s; cached-source Drama 50
+preview 0.18s; Pop 30 + Drama 50 / saturation -20 preview 0.27s; full-resolution
+Drama 50 6.78s; full-resolution combined Pop/Drama 23.40s. These pipeline timings
+exclude worker startup/network/browser decode and include some concurrent test
+load. Since combined processing can exceed the former 25-second budget,
+full-resolution Drama jobs get 60 seconds. Preview jobs retain their separate
+slot and 25-second limit. The displayed preview stays in place during refinement;
+existing request generations discard obsolete results without resetting zoom/pan.
+
+Tests cover legacy defaults, malformed Drama recipes, cache-key differences,
+HTTP persistence/rendering, exact zero-strength JPEG equivalence with Gamma/Pop,
+saturation direction and monochrome, increasing effect strength, brightness,
+resolution consistency, source integrity, gradients, seeded dark noise and extreme
+boundaries. Browser logic tests cover all-adjustment Save/Reset/Cancel, fullscreen
+session retention and obsolete decoded results. Six local photographs were
+visually compared at strength 0/50/100 and strength 50 with saturation -50,
+covering faces, foliage, brickwork, pale skies, indoor shadows and snowy mountains.
+
+Limitations: the soft noise gate is not denoising, and high settings can emphasise
+noise, skin texture and halos. The local tone stage intentionally brightens dark
+scenes and dims bright ones; exact mean exposure preservation is not promised.
+Strong positive saturation can clip colours on sRGB conversion. Preview resizing
+removes fine structures, so full output may reveal more texture. Full-resolution
+Lab/detail materialization uses substantial RAM, especially with both effects.
+Further tuning should use modern cloudy/underexposed 50MP images and target NUC
+hardware, plus manual normal/fullscreen browser interaction. Future refinements
+could use edge-aware bases, better noise gating and additional preset parameters.

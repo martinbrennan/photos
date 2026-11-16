@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import subprocess
+import sys
 from unittest.mock import patch
 from pathlib import Path
 from urllib.error import HTTPError
@@ -14,7 +15,7 @@ from PIL import Image
 
 from catalogue.database import connect
 from catalogue.scanner import scan
-from catalogue.slideshow import PhotoStore, make_server, read_database
+from catalogue.slideshow import PhotoStore, RenderCancelled, make_server, read_database
 
 
 class Reader:
@@ -145,6 +146,123 @@ class SlideshowTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_cancelled_full_render_kills_worker_and_releases_slot(self):
+        cancelled, entered = threading.Event(), threading.Event()
+        children, errors = [], []
+        real_popen = subprocess.Popen
+        photo_id = self.store.pick()['id']
+
+        def slow_worker(*args, **kwargs):
+            child = real_popen([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+            children.append(child)
+            entered.set()
+            return child
+
+        def render():
+            self.store.request_context.cancelled = cancelled.is_set
+            try:
+                self.store.image(photo_id, {'gamma': .8}, edge=0)
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch('catalogue.slideshow.subprocess.Popen', side_effect=slow_worker):
+            thread = threading.Thread(target=render)
+            thread.start()
+            self.assertTrue(entered.wait(3))
+            cancelled.set()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertIsInstance(errors[0], RenderCancelled)
+        self.assertIsNotNone(children[0].poll())
+        self.assertTrue(self.store.full_lock.acquire(blocking=False))
+        self.store.full_lock.release()
+        self.assertNotIn(photo_id, self.store.failed)
+        self.assertTrue(self.store.image(photo_id, {'gamma': .9}, edge=0).startswith(b'\xff\xd8'))
+
+    def test_http_abort_stops_full_worker_and_latest_preview_succeeds(self):
+        import http.client
+        import socket
+        server = make_server(self.database, port=0)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        real_popen = subprocess.Popen
+        entered = threading.Event()
+        children = []
+
+        def worker(*args, **kwargs):
+            child = real_popen([sys.executable, '-c',
+                'import json,sys,time; v=json.load(sys.stdin); '
+                'time.sleep(30 if v["edge"] == 0 else 0); '
+                'sys.stdout.buffer.write(bytes([255,216,255,217]))'], **kwargs)
+            children.append(child)
+            entered.set()
+            return child
+
+        connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+        photo_id = self.store.pick()['id']
+        try:
+            with patch('catalogue.slideshow.subprocess.Popen', side_effect=worker):
+                connection.request('GET', f'/api/render/{photo_id}?gamma=.8&edge=0')
+                self.assertTrue(entered.wait(3))
+                connection.sock.shutdown(socket.SHUT_RDWR)
+                connection.close()
+                with urlopen(f'http://127.0.0.1:{server.server_port}/api/render/{photo_id}?gamma=.9&edge=1440', timeout=3) as response:
+                    self.assertTrue(response.read().startswith(b'\xff\xd8'))
+                children[0].wait(timeout=3)
+                self.assertNotEqual(children[0].returncode, 0)
+        finally:
+            connection.close()
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+            server.shutdown()
+            server.server_close()
+            serving.join(3)
+
+    def test_cancelled_preview_leaves_queue_without_rendering(self):
+        cancelled = threading.Event()
+        errors = []
+        photo_id = self.store.pick()['id']
+        self.store.image_lock.acquire()
+
+        def waiting():
+            self.store.request_context.cancelled = cancelled.is_set
+            try:
+                self.store.image(photo_id, {'gamma': .8}, edge=1440)
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            with patch.object(self.store, 'render') as render:
+                thread = threading.Thread(target=waiting)
+                thread.start()
+                cancelled.set()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                render.assert_not_called()
+            self.assertIsInstance(errors[0], RenderCancelled)
+        finally:
+            self.store.image_lock.release()
+
+    def test_error_reply_tolerates_browser_disconnect(self):
+        # Exercise the error handler too: the failing write occurs inside an
+        # exception handler, where a sibling except cannot catch it.
+        with patch('catalogue.slideshow.ThreadingHTTPServer') as server_type:
+            make_server(self.database, port=0)
+            handler_type = server_type.call_args.args[1]
+        handler = object.__new__(handler_type)
+        handler.path = '/api/render/1'
+        with patch.object(handler, 'render_image', side_effect=OSError('decode failed')), \
+             patch.object(handler, 'send_response'), \
+             patch.object(handler, 'send_header'), \
+             patch.object(handler, 'end_headers'):
+            from unittest.mock import Mock
+            handler.wfile = Mock()
+            handler.wfile.write.side_effect = BrokenPipeError()
+            handler.do_GET()
+        self.assertTrue(handler.close_connection)
 
     def test_http_endpoints(self):
         server = make_server(self.database, port=0, interval=7)
